@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>VLM + Object Detection</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root { --glass: rgba(0,0,0,.52); --blur: 12px; --radius: 16px; --accent:#3fb950; }
+    html, body { margin:0; height:100%; background:#111; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow:hidden; }
+    #video { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+    #canvas { display:none; }
+    #detOverlay { position:fixed; inset:0; pointer-events:none; z-index:7; }
+
+    /* Top bar */
+    .topbar { position:fixed; top:12px; left:16px; right:16px; display:flex; align-items:center; gap:10px; pointer-events:none; z-index:9; }
+    .chip { pointer-events:auto; display:inline-flex; align-items:center; gap:8px; background:var(--glass); backdrop-filter:blur(var(--blur)); border-radius:999px; padding:8px 12px; font-weight:700; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); }
+    .spacer { flex:1; }
+    .btn { pointer-events:auto; border:none; font-weight:700; cursor:pointer; padding:10px 14px; border-radius:999px; background:#c5c7cf; color:#111; opacity:.95 }
+
+    /* Left stack */
+    #leftStack { position:fixed; left:24px; bottom:24px; display:flex; flex-direction:column; gap:14px; max-width:520px; z-index:8; }
+    .panel { background:var(--glass); backdrop-filter: blur(var(--blur)); border-radius:var(--radius); padding:16px 18px; box-shadow: 0 4px 30px rgba(0,0,0,.25); }
+    .panel h4 { margin:0; opacity:.9; font-weight:800; letter-spacing:.2px; }
+
+    .panel-header { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    .panel-header .title { flex:1; }
+    .collapse-btn {
+      pointer-events:auto; background: rgba(255,255,255,0.15);
+      border:1px solid rgba(255,255,255,0.2); color:#fff;
+      width:28px; height:28px; border-radius:8px; cursor:pointer;
+      font-size:18px; line-height:0; display:flex; align-items:center; justify-content:center;
+      transition:background .15s ease;
+    }
+    .collapse-btn:hover { background: rgba(255,255,255,0.25); }
+
+    .suggestions { display:flex; flex-direction:column; gap:10px; max-height:32vh; overflow:auto; }
+    .sugg { display:flex; gap:10px; align-items:flex-start; cursor:pointer; padding:8px 10px; border-radius:10px; }
+    .sugg:hover { background:rgba(255,255,255,.08); }
+
+    /* Collapsed state */
+    #suggestionsPanel.collapsed .suggestions { display:none; }
+    #suggestionsPanel.collapsed .panel-header { margin-bottom:0; }
+
+    /* Prompt bar */
+    .promptbar { display:flex; align-items:center; gap:10px; padding:12px 14px; }
+    .promptbar input { flex:1; border:none; outline:none; background:transparent; color:#fff; font-size:15px; }
+    .promptbar .send { background:#ffffff20; color:#fff; border:1px solid #ffffff33; border-radius:12px; padding:6px 10px; cursor:pointer; }
+
+    /* Right caption card */
+    #captionBox { position:fixed; right:24px; bottom:24px; width:min(560px, 46vw); z-index:8; }
+    .status-row { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-weight:800; }
+    .status-dot { width:8px; height:8px; border-radius:50%; background:var(--accent); }
+    #out { white-space:pre-wrap; line-height:1.4; font-size:16px; opacity:.95; }
+    #meta { opacity:.75; font-size:12px; margin-top:8px; }
+
+    @media (max-width: 820px) {
+      #leftStack { left:12px; right:12px; max-width:none; }
+      #captionBox { right:12px; left:12px; width:auto; }
+      .topbar { left:12px; right:12px; }
+    }
+  </style>
+
+  <!-- transformers.js (FastVLM) -->
+  <script type="importmap">
+    { "imports": { "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2" } }
+  </script>
+
+  <!-- ONNX Runtime Web via CDN (no local .wasm files needed) -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="canvas"></canvas>
+  <canvas id="detOverlay"></canvas>
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <div class="chip"><span class="dot"></span> Live</div>
+    <div class="chip">Backend: <b id="backendName" style="margin-left:6px">WEBGPU</b></div>
+    <div class="chip">Source: <b id="sourceName" style="margin-left:6px">LOCAL</b></div>
+    <div class="chip">Detector: <b id="detStatus" style="margin-left:6px">Loading…</b></div>
+    <div id="saveMeta" class="chip" style="font-weight:600; opacity:.9">data.json: —</div>
+    <div class="spacer"></div>
+    <button id="overlayBtn" class="btn">Overlays: On</button>
+    <button id="toggleRunBtn" class="btn">Pause</button>
+    <button id="switchSrcBtn" class="btn">Switch Local/Remote</button>
+    <button id="downloadBtn" class="btn">Download JSON</button>
+  </div>
+
+  <!-- Left: suggestions (collapsible) + prompt -->
+  <div id="leftStack">
+    <div id="suggestionsPanel" class="panel">
+      <div class="panel-header">
+        <h4 class="title">Suggested Prompts</h4>
+        <button id="minimizeBtn" class="collapse-btn" aria-label="Minimize suggestions">−</button>
+      </div>
+      <div class="suggestions" id="suggList"></div>
+    </div>
+
+    <div class="panel promptbar">
+      <input id="prompt" placeholder="Describe what changed since the previous moment." />
+      <button class="send" id="sendBtn">Ask</button>
+    </div>
+  </div>
+
+  <!-- Right: live caption -->
+  <div id="captionBox" class="panel">
+    <div class="status-row"><span class="status-dot"></span> <span><b>Rolling Caption</b></span></div>
+    <div id="out">Loading model…</div>
+    <div id="meta"></div>
+  </div>
+
+<script type="module">
+import {
+  AutoProcessor,
+  AutoModelForImageTextToText,
+  RawImage,
+  TextStreamer,
+  env
+} from "@huggingface/transformers";
+
+/* ---------- Require WebGPU ---------- */
+if (!('gpu' in navigator)) {
+  document.getElementById("out").textContent =
+    "WebGPU not available. Use Chrome/Edge 121+ (or Safari TP) with WebGPU enabled.";
+  throw new Error("WebGPU required");
+}
+env.backends.onnx.webgpu = { powerPreference: "high-performance" };
+
+/* ---------- ORT Web (CDN WASM) ---------- */
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+ort.env.wasm.simd = true;
+ort.env.wasm.numThreads = 2;
+
+/* ---------- Paths & Policy ---------- */
+const LOCAL_PATH = "./fastvlm-local/";              // local-first
+const REMOTE_ID  = "onnx-community/FastVLM-0.5B-ONNX";
+env.allowLocalModels  = true;
+env.allowRemoteModels = true;                       // can switch later
+
+/* YOLO model + names */
+const YOLO_MODEL_URL = "./weapons_yolov8.onnx";
+const YOLO_NAMES_URL = "./weapons.names.json";
+
+/* ---------- DOM ---------- */
+const video        = document.getElementById("video");
+const canvas       = document.getElementById("canvas");
+const detOverlay   = document.getElementById("detOverlay");
+const out          = document.getElementById("out");
+const meta         = document.getElementById("meta");
+const sourceName   = document.getElementById("sourceName");
+const toggleRunBtn = document.getElementById("toggleRunBtn");
+const switchSrcBtn = document.getElementById("switchSrcBtn");
+const promptInput  = document.getElementById("prompt");
+const sendBtn      = document.getElementById("sendBtn");
+const suggList     = document.getElementById("suggList");
+const minimizeBtn  = document.getElementById("minimizeBtn");
+const suggestionsPanel = document.getElementById("suggestionsPanel");
+const backendNameEl = document.getElementById("backendName");
+const downloadBtn   = document.getElementById("downloadBtn");
+const saveMetaEl    = document.getElementById("saveMeta");
+const overlayBtn    = document.getElementById("overlayBtn");
+const detStatusEl   = document.getElementById("detStatus");
+
+/* ---------- StreamingVLM-style captioning ---------- */
+const SYSTEM_PROMPT = `
+You are an intelligent visual observer providing concise, real-time descriptions of unfolding scenes.
+Describe only what changed between frames: movements, interactions, gestures, state changes, or new events.
+Speak in 1–2 short, factual sentences (present tense, active voice). Focus on actions over static details.
+Keep under 18 words total. If nothing meaningful changed, respond with "No change."
+Avoid guessing emotions, names, or intent unless clearly visible. Mention background only if relevant to the action.
+`.trim();
+
+const FEWSHOT = [
+  { role: "user",      content: "Describe the moment." },
+  { role: "assistant", content: "Person raises hand. Waves briefly." },
+  { role: "user",      content: "Describe the moment." },
+  { role: "assistant", content: "Object falls off table. Person steps back." },
+  { role: "user",      content: "Describe the moment." },
+  { role: "assistant", content: "Vehicle slows. Door opens." }
+];
+
+/* ---------- Rolling decode ---------- */
+const CONTEXT_FRAMES = 6;
+const TARGET_WIDTH   = 640;
+const MAX_NEW_TOKENS = 48;
+let   POLL_MS        = 900;
+
+/* ---------- State ---------- */
+let useLocal = true;
+let running  = true;
+let lock     = false;
+let processor, model, stream, intervalId;
+let history = [];
+let buffer  = [];     // in-memory buffer mirrored to OPFS
+
+/* Detector state */
+let detSession = null;
+let overlayOn = true;
+let classNames = ["handgun","assault rifle","Person","unknown weapon"];
+const YOLO_SIZE=640, YOLO_CONF=0.15, YOLO_IOU=0.45;
+const tmpCanvas = document.createElement("canvas");
+const tmpCtx = tmpCanvas.getContext("2d",{willReadFrequently:true});
+
+/* ---------- UI ---------- */
+backendNameEl.textContent = "WEBGPU";
+sourceName.textContent = "LOCAL";
+
+function renderSuggestions() {
+  const SUGGESTIONS = [
+    "Describe what changed since the previous moment.",
+    "Is anything moving? What moved?",
+    "Identify any new or disappearing objects.",
+    "Describe any gestures you notice.",
+    "Read any visible text."
+  ];
+  suggList.innerHTML = "";
+  SUGGESTIONS.forEach(text => {
+    const row = document.createElement("div");
+    row.className = "sugg";
+    row.innerHTML = `<span style="opacity:.7">↠</span><div>${text}</div>`;
+    row.onclick = () => { promptInput.value = text; tryInfer(text); };
+    suggList.appendChild(row);
+  });
+}
+function setRunningUI(on) {
+  running = on;
+  toggleRunBtn.textContent = on ? "Pause" : "Resume";
+}
+function ensureLoop() {
+  if (intervalId) { clearInterval(intervalId); intervalId = null; }
+  if (running) intervalId = setInterval(() => loopTick(), POLL_MS);
+}
+minimizeBtn.onclick = () => {
+  const collapsed = suggestionsPanel.classList.toggle("collapsed");
+  minimizeBtn.textContent = collapsed ? "+" : "−";
+  if (collapsed) setTimeout(() => promptInput?.focus(), 50);
+};
+
+/* ---------- Camera & Frames ---------- */
+async function setupCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+  video.srcObject = stream;
+  await video.play();
+  requestAnimationFrame(resizeOverlay);
+}
+function resizeOverlay(){
+  const r=video.getBoundingClientRect();
+  detOverlay.width=r.width;detOverlay.height=r.height;
+}
+window.addEventListener("resize",resizeOverlay);
+
+function grabFrame() {
+  if (!video.videoWidth) return null;
+  const scale = Math.min(1, TARGET_WIDTH / video.videoWidth);
+  const w = Math.max(64, Math.round(video.videoWidth * scale));
+  const h = Math.max(64, Math.round(video.videoHeight * scale));
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(video, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
+
+/* ---------- Prompt Builder ---------- */
+function buildMessages(promptText) {
+  const msgs = [{ role: "system", content: SYSTEM_PROMPT }];
+  for (const m of FEWSHOT) msgs.push(m);
+  const recent = history.slice(-CONTEXT_FRAMES);
+  if (recent.length) {
+    const prev = recent.map(r => `Prev ${new Date(r.t).toLocaleTimeString()}: ${r.caption}`).join(" ");
+    msgs.push({ role: "user", content: prev });
+    msgs.push({ role: "assistant", content: "(acknowledged)" });
+  }
+  msgs.push({ role: "user", content: `<image>${promptText || "Describe the moment."}` });
+  return msgs;
+}
+
+/* ---------- Model Loading ---------- */
+async function loadModel(localPreferred = true) {
+  useLocal = localPreferred;
+  sourceName.textContent = useLocal ? "LOCAL" : "REMOTE";
+  out.textContent = useLocal ? "Loading FastVLM from local (WebGPU)…" : "Fetching FastVLM from Hub (WebGPU)…";
+  const path = useLocal ? LOCAL_PATH : REMOTE_ID;
+  try {
+    processor = await AutoProcessor.from_pretrained(path);
+    model     = await AutoModelForImageTextToText.from_pretrained(path, {
+      device: "webgpu",
+      dtype: { embed_tokens: "fp16", vision_encoder: "q4", decoder_model_merged: "q4" }
+    });
+    out.textContent = "Model ready.";
+  } catch (e) {
+    out.textContent = "Load failed: " + (e?.message || e);
+    if (useLocal && env.allowRemoteModels) {
+      useLocal = false;
+      sourceName.textContent = "REMOTE";
+      processor = await AutoProcessor.from_pretrained(REMOTE_ID);
+      model     = await AutoModelForImageTextToText.from_pretrained(REMOTE_ID, {
+        device: "webgpu",
+        dtype: { embed_tokens: "fp16", vision_encoder: "q4", decoder_model_merged: "q4" }
+      });
+      out.textContent = "Model ready (remote fallback).";
+    } else {
+      throw e;
+    }
+  }
+}
+
+/* ---------- OPFS helpers (create on first load + auto-overwrite) ---------- */
+async function getRootDir() { return await navigator.storage.getDirectory(); }
+async function getDataHandle(create = true) {
+  const root = await getRootDir();
+  return await root.getFileHandle("data.json", { create });
+}
+function tsName(d = new Date()) {
+  const pad = n => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const MM   = pad(d.getMonth()+1);
+  const dd   = pad(d.getDate());
+  const hh   = pad(d.getHours());
+  const mm   = pad(d.getMinutes());
+  const ss   = pad(d.getSeconds());
+  return `data-${yyyy}-${MM}-${dd}_${hh}-${mm}-${ss}.json`;
+}
+async function ensureDataFile() {
+  const handle = await getDataHandle(true);
+  const file   = await handle.getFile();
+  let text = "";
+  try { text = await file.text(); } catch {}
+  if (!text || !text.trim()) {
+    await writeDataJSON([]);
+  } else {
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) await writeDataJSON([]);
+    } catch { await writeDataJSON([]); }
+  }
+}
+async function readDataJSON() {
+  try {
+    const handle = await getDataHandle(false);
+    const file = await handle.getFile();
+    const text = await file.text();
+    const parsed = text.trim() ? JSON.parse(text) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+async function writeDataJSON(arr) {
+  const handle = await getDataHandle(true);
+  const writable = await handle.createWritable();
+  await writable.write(new Blob([JSON.stringify(arr, null, 2)], { type: "application/json" }));
+  await writable.close();
+  saveMetaEl.textContent = `data.json: saved @ ${new Date().toLocaleTimeString()}`;
+}
+async function appendAutoSave(record) {
+  buffer.push(record);
+  await writeDataJSON(buffer);
+}
+async function downloadCurrentJSON() {
+  await writeDataJSON(buffer);
+  const blob = new Blob([JSON.stringify(buffer, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = tsName();
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+downloadBtn.onclick = downloadCurrentJSON;
+
+/* ---------- Inference (captions) ---------- */
+async function tryInfer(promptText) {
+  if (!running || lock) return;
+  lock = true;
+  const t0 = performance.now();
+
+  try {
+    const frame = grabFrame();
+    if (!frame) { lock = false; return; }
+    const img = new RawImage(frame.data, frame.width, frame.height, 4);
+
+    const messages = buildMessages(promptText);
+    const prompt   = processor.apply_chat_template(messages, { add_generation_prompt: true });
+    const inputs   = await processor(img, prompt, { add_special_tokens: false });
+
+    let text = "";
+    const streamer = new TextStreamer(processor.tokenizer, {
+      skip_prompt: true, skip_special_tokens: true,
+      callback_function: tok => {
+        text += tok;
+        const clipped = text
+          .replace(/\s+/g, " ").trim()
+          .replace(/(?:\.){2,}$/,".")
+          .split(/(?<=\.)\s/).slice(0, 2).join(" ");
+        out.textContent = clipped || "";
+      }
+    });
+
+    await model.generate({
+      ...inputs,
+      max_new_tokens: MAX_NEW_TOKENS,
+      do_sample: false,
+      repetition_penalty: 1.15,
+      streamer
+    });
+
+    let final = text.replace(/\s+/g, " ").trim()
+                    .replace(/(?:\.){2,}$/,".")
+                    .split(/(?<=\.)\s/).slice(0, 2).join(" ");
+    if (!final) final = "No change.";
+
+    history.push({ t: Date.now(), caption: final.slice(0, 240) });
+    if (history.length > CONTEXT_FRAMES) history = history.slice(-CONTEXT_FRAMES);
+
+    const record = {
+      timestamp: new Date().toISOString(),
+      model_source: useLocal ? "Local" : "Remote",
+      prompt: promptText || "Describe the moment.",
+      response: final,
+      frame: { width: canvas.width, height: canvas.height }
+    };
+    await appendAutoSave(record);
+
+  } catch (e) {
+    out.textContent = "Error: " + (e?.message || e);
+  } finally {
+    const dt = Math.max(0, Math.round(performance.now() - t0));
+    meta.textContent = `Frame ${canvas.width}×${canvas.height} • Inference: ~${dt} ms • Poll: ${POLL_MS} ms • Source: ${useLocal ? "LOCAL" : "REMOTE"}`;
+    lock = false;
+  }
+}
+
+/* ---------- Detector (YOLOv8 ONNX, ORT Web) ---------- */
+function sigmoid(x){return 1/(1+Math.exp(-x));}
+function iou(a,b){const[x1,y1,x2,y2]=a,[X1,Y1,X2,Y2]=b;
+  const w=Math.max(0,Math.min(x2,X2)-Math.max(x1,X1));
+  const h=Math.max(0,Math.min(y2,Y2)-Math.max(y1,Y1));
+  const inter=w*h;const A=(x2-x1)*(y2-y1),B=(X2-X1)*(Y2-Y1);
+  return inter/(A+B-inter+1e-6);}
+function nms(boxes,scores,t=0.45){const idx=scores.map((s,i)=>[s,i]).sort((a,b)=>b[0]-a[0]).map(x=>x[1]);const keep=[];
+  while(idx.length&&keep.length<300){const i=idx.shift();keep.push(i);
+    for(let k=idx.length-1;k>=0;k--)if(iou(boxes[i],boxes[idx[k]])>=t)idx.splice(k,1);}
+  return keep;}
+
+function letterbox(imgData,dst=YOLO_SIZE){
+  const srcW=imgData.width,srcH=imgData.height;
+  const r=Math.min(dst/srcW,dst/srcH);
+  const newW=Math.round(srcW*r),newH=Math.round(srcH*r);
+  const padX=Math.floor((dst-newW)/2),padY=Math.floor((dst-newH)/2);
+  const tmp=document.createElement("canvas");
+  tmp.width=dst;tmp.height=dst;
+  const ctx=tmp.getContext("2d",{willReadFrequently:true});
+  ctx.fillStyle="rgb(114,114,114)";ctx.fillRect(0,0,dst,dst);
+  const src=document.createElement("canvas");
+  src.width=srcW;src.height=srcH;src.getContext("2d").putImageData(imgData,0,0);
+  ctx.drawImage(src,0,0,newW,newH,padX,padY,newW,newH);
+  const {data}=ctx.getImageData(0,0,dst,dst);
+  const f=new Float32Array(dst*dst*3);
+  for(let i=0,j=0;i<data.length;i+=4,j+=3){
+    f[j]=data[i]/255;f[j+1]=data[i+1]/255;f[j+2]=data[i+2]/255;}
+  return {tensor:new ort.Tensor("float32",f,[1,3,dst,dst]),ratio:r,padX,padY,srcW,srcH};
+}
+function normalizeOutputs(outputs){
+  const keys=Object.keys(outputs);
+  if(keys.length===1)return {data:outputs[keys[0]].data,dims:outputs[keys[0]].dims};
+  return {boxes:outputs[keys[0]].data,scores:outputs[keys[1]].data,d1:outputs[keys[0]].dims,d2:outputs[keys[1]].dims};
+}
+function decodeYOLONormalized(out,meta){
+  let rows=[];
+  if(out.data){ // single output (N x (4+nc)) or ( (4+nc) x N )
+    const [a,b,c]=out.dims; // be agnostic
+    const N=Math.max(a,b,c||1);
+    const C=(a*b*c)/N;
+    const perBox=C;
+    const arr=out.data;
+    for(let i=0;i<N;i++){
+      const off=i*perBox;
+      const cx=arr[off+0],cy=arr[off+1],w=arr[off+2],h=arr[off+3];
+      let best=0,id=-1;
+      for(let j=4;j<perBox;j++){const sc=sigmoid(arr[off+j]);if(sc>best){best=sc;id=j-4;}}
+      if(best>YOLO_CONF)rows.push({cx,cy,w,h,score:best,cls:id});
+    }
+  } else { // split (boxes,scores) – not typical for v8, but handle anyway
+    const B = out.d1[0] || out.d2[out.d2.length-1];
+    for(let i=0;i<B;i++){
+      const off=i*4;
+      const cx=out.boxes[off+0],cy=out.boxes[off+1],w=out.boxes[off+2],h=out.boxes[off+3];
+      let best=0,id=-1, base=i*classNames.length;
+      for(let j=0;j<classNames.length;j++){const sc=sigmoid(out.scores[base+j]);if(sc>best){best=sc;id=j;}}
+      if(best>YOLO_CONF)rows.push({cx,cy,w,h,score:best,cls:id});
+    }
+  }
+  const {ratio,padX,padY,srcW,srcH}=meta;
+  const boxes=[],scores=[],labels=[];
+  for(const r of rows){
+    let x1=(r.cx-r.w/2-padX)/ratio;
+    let y1=(r.cy-r.h/2-padY)/ratio;
+    let x2=(r.cx+r.w/2-padX)/ratio;
+    let y2=(r.cy+r.h/2-padY)/ratio;
+    x1=Math.max(0,Math.min(srcW,x1));y1=Math.max(0,Math.min(srcH,y1));
+    x2=Math.max(0,Math.min(srcW,x2));y2=Math.max(0,Math.min(srcH,y2));
+    boxes.push([x1,y1,x2,y2]);scores.push(r.score);labels.push(r.cls);
+  }
+  const keep=nms(boxes,scores,YOLO_IOU);
+  return keep.map(i=>({box:boxes[i],score:scores[i],cls:labels[i]}));
+}
+function drawDetections(dets){
+  const r=video.getBoundingClientRect();
+  const ctx=detOverlay.getContext("2d");
+  ctx.clearRect(0,0,detOverlay.width,detOverlay.height);
+  if(!overlayOn) return;
+  ctx.lineWidth=2;ctx.font="12px system-ui";
+  for(const d of dets){
+    const [x1,y1,x2,y2]=d.box;
+    const sx1=(x1/video.videoWidth)*r.width,sy1=(y1/video.videoHeight)*r.height;
+    const sx2=(x2/video.videoWidth)*r.width,sy2=(y2/video.videoHeight)*r.height;
+    ctx.strokeStyle="#3fb950";ctx.fillStyle="#3fb950";
+    ctx.strokeRect(sx1,sy1,sx2-sx1,sy2-sy1);
+    const label=`${classNames[d.cls]||"obj"} ${(d.score*100).toFixed(1)}%`;
+    const tw=ctx.measureText(label).width+6;const th=14;
+    const ly=Math.max(0,sy1-th);
+    ctx.fillRect(sx1,ly,tw,th);
+    ctx.fillStyle="#111";ctx.fillText(label,sx1+3,ly+11);
+  }
+}
+async function loadYOLO(){
+  try{
+    const r=await fetch(YOLO_NAMES_URL);
+    if(r.ok){ const j=await r.json(); if(Array.isArray(j)&&j.length) classNames=j; }
+  }catch{}
+  detSession=await ort.InferenceSession.create(YOLO_MODEL_URL,{executionProviders:["wasm"]});
+  detStatusEl.textContent="Ready";
+}
+async function runDetectorOnce(){
+  if(!detSession) return;
+  tmpCanvas.width=video.videoWidth; tmpCanvas.height=video.videoHeight;
+  tmpCtx.drawImage(video,0,0);
+  const frame=tmpCtx.getImageData(0,0,tmpCanvas.width,tmpCanvas.height);
+  const meta = letterbox(frame);
+  const feeds = { [detSession.inputNames[0]]: meta.tensor };
+  const outputs = await detSession.run(feeds);
+  const norm = normalizeOutputs(outputs);
+  const dets = decodeYOLONormalized(norm, meta);
+  drawDetections(dets);
+}
+
+/* ---------- Main loop ---------- */
+async function loopTick(){
+  await runDetectorOnce();
+  await tryInfer(promptInput.value.trim());
+}
+
+/* ---------- Events ---------- */
+overlayBtn.onclick = () => {
+  overlayOn = !overlayOn;
+  overlayBtn.textContent = `Overlays: ${overlayOn ? "On" : "Off"}`;
+  if (!overlayOn) {
+    const ctx=detOverlay.getContext("2d");
+    ctx.clearRect(0,0,detOverlay.width,detOverlay.height);
+  }
+};
+toggleRunBtn.onclick = () => {
+  setRunningUI(!running);
+  ensureLoop();
+  if (running) loopTick();
+};
+sendBtn.onclick = () => tryInfer(promptInput.value.trim());
+promptInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); tryInfer(promptInput.value.trim()); }
+});
+switchSrcBtn.onclick = async () => {
+  setRunningUI(false); ensureLoop();
+  await loadModel(!useLocal);
+  setRunningUI(true); ensureLoop();
+  loopTick();
+};
+
+/* ---------- Boot ---------- */
+renderSuggestions();
+(async () => {
+  await loadModel(true);         // local-first
+  await setupCamera();
+  await loadYOLO();
+  setRunningUI(true);
+  ensureLoop();
+
+  // Ensure data.json exists and is a valid array, then warm in-memory buffer
+  await ensureDataFile();
+  buffer = await readDataJSON();
+
+  // Append session_start on first load (creates file if just initialized)
+  const sessionStart = { _meta: "session_start", at: new Date().toISOString() };
+  await appendAutoSave(sessionStart);
+})();
+</script>
+</body>
+</html>
